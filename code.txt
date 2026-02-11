@@ -1,0 +1,1417 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <SPI.h>
+#include <SD.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+
+#define DBG_OUTPUT_PORT Serial
+
+// Настройки точки доступа
+const char* ssid = "ChatESP32-CAM-ofline";
+const char* password = "";
+const char* host = "chat";
+
+// Лимит подключений
+const int MAX_CLIENTS = 60;
+int connectedClients = 0;
+
+WebServer server(80);
+Preferences preferences;
+
+// Структуры для хранения данных
+struct User {
+  String username;
+  String password;
+  String displayName;
+};
+
+struct Message {
+  String fromUser;
+  String toUser;
+  String content;
+  unsigned long timestamp;
+};
+
+// Временное хранилище данных
+std::vector<User> users;
+std::vector<Message> messages;
+String currentUser = "";
+
+// Флаги
+static bool hasSD = false;
+File uploadFile;
+
+// Функция для проверки лимита подключений
+bool canAcceptClient() {
+  if (connectedClients < MAX_CLIENTS) {
+    connectedClients++;
+    DBG_OUTPUT_PORT.println("Client connected. Total: " + String(connectedClients));
+    return true;
+  }
+  return false;
+}
+
+void disconnectClient() {
+  if (connectedClients > 0) {
+    connectedClients--;
+    DBG_OUTPUT_PORT.println("Client disconnected. Total: " + String(connectedClients));
+  }
+}
+
+void returnOK() {
+  server.send(200, "text/plain", "");
+}
+
+void returnFail(String msg) {
+  server.send(500, "text/plain", msg + "\r\n");
+}
+
+// Функции для работы с пользователями
+bool userExists(String username) {
+  for (const User& user : users) {
+    if (user.username == username) {
+      return true;
+    }
+  }
+  return false;
+}
+
+User* getUser(String username) {
+  for (User& user : users) {
+    if (user.username == username) {
+      return &user;
+    }
+  }
+  return nullptr;
+}
+
+bool authenticateUser(String username, String password) {
+  User* user = getUser(username);
+  return user != nullptr && user->password == password;
+}
+
+// Сохранение данных в память
+void saveUsersToPreferences() {
+  preferences.begin("chat-users", false);
+  preferences.putUInt("userCount", users.size());
+  
+  for (size_t i = 0; i < users.size(); i++) {
+    String prefix = "user" + String(i);
+    preferences.putString((prefix + "_username").c_str(), users[i].username);
+    preferences.putString((prefix + "_password").c_str(), users[i].password);
+    preferences.putString((prefix + "_displayName").c_str(), users[i].displayName);
+  }
+  preferences.end();
+  DBG_OUTPUT_PORT.println("Users saved to preferences");
+}
+
+void loadUsersFromPreferences() {
+  preferences.begin("chat-users", true);
+  unsigned int userCount = preferences.getUInt("userCount", 0);
+  
+  users.clear();
+  for (size_t i = 0; i < userCount; i++) {
+    String prefix = "user" + String(i);
+    User user;
+    user.username = preferences.getString((prefix + "_username").c_str(), "");
+    user.password = preferences.getString((prefix + "_password").c_str(), "");
+    user.displayName = preferences.getString((prefix + "_displayName").c_str(), "");
+    
+    if (user.username.length() > 0) {
+      users.push_back(user);
+    }
+  }
+  preferences.end();
+  DBG_OUTPUT_PORT.println("Loaded " + String(users.size()) + " users from preferences");
+}
+
+void saveMessagesToPreferences() {
+  preferences.begin("chat-messages", false);
+  preferences.putUInt("messageCount", messages.size());
+  
+  for (size_t i = 0; i < messages.size(); i++) {
+    String prefix = "msg" + String(i);
+    preferences.putString((prefix + "_from").c_str(), messages[i].fromUser);
+    preferences.putString((prefix + "_to").c_str(), messages[i].toUser);
+    preferences.putString((prefix + "_content").c_str(), messages[i].content);
+    preferences.putULong((prefix + "_timestamp").c_str(), messages[i].timestamp);
+  }
+  preferences.end();
+  DBG_OUTPUT_PORT.println("Messages saved to preferences");
+}
+
+void loadMessagesFromPreferences() {
+  preferences.begin("chat-messages", true);
+  unsigned int messageCount = preferences.getUInt("messageCount", 0);
+  
+  messages.clear();
+  for (size_t i = 0; i < messageCount; i++) {
+    String prefix = "msg" + String(i);
+    Message msg;
+    msg.fromUser = preferences.getString((prefix + "_from").c_str(), "");
+    msg.toUser = preferences.getString((prefix + "_to").c_str(), "");
+    msg.content = preferences.getString((prefix + "_content").c_str(), "");
+    msg.timestamp = preferences.getULong((prefix + "_timestamp").c_str(), 0);
+    
+    if (msg.fromUser.length() > 0 && msg.toUser.length() > 0) {
+      messages.push_back(msg);
+    }
+  }
+  preferences.end();
+  DBG_OUTPUT_PORT.println("Loaded " + String(messages.size()) + " messages from preferences");
+}
+
+// API endpoints
+void handleRegister() {
+  if (!canAcceptClient()) {
+    server.send(503, "application/json", "{\"error\":\"Server is full. Try again later.\"}");
+    return;
+  }
+
+  if (server.method() != HTTP_POST) {
+    server.send(405, "application/json", "{\"error\":\"Method not allowed\"}");
+    disconnectClient();
+    return;
+  }
+
+  String username = server.arg("username");
+  String password = server.arg("password");
+  String displayName = server.arg("display_name");
+
+  if (username.length() == 0 || password.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"Username and password required\"}");
+    disconnectClient();
+    return;
+  }
+
+  if (userExists(username)) {
+    server.send(400, "application/json", "{\"error\":\"User already exists\"}");
+    disconnectClient();
+    return;
+  }
+
+  users.push_back({username, password, displayName});
+  saveUsersToPreferences();
+  server.send(200, "application/json", "{\"success\":\"User registered successfully\"}");
+  disconnectClient();
+}
+
+void handleLogin() {
+  if (!canAcceptClient()) {
+    server.send(503, "application/json", "{\"error\":\"Server is full. Try again later.\"}");
+    return;
+  }
+
+  if (server.method() != HTTP_POST) {
+    server.send(405, "application/json", "{\"error\":\"Method not allowed\"}");
+    disconnectClient();
+    return;
+  }
+
+  String username = server.arg("username");
+  String password = server.arg("password");
+
+  if (authenticateUser(username, password)) {
+    currentUser = username;
+    server.send(200, "application/json", "{\"success\":\"Login successful\", \"user\":\"" + username + "\"}");
+  } else {
+    server.send(401, "application/json", "{\"error\":\"Invalid credentials\"}");
+    disconnectClient();
+  }
+}
+
+void handleLogout() {
+  currentUser = "";
+  server.send(200, "application/json", "{\"success\":\"Logged out\"}");
+  disconnectClient();
+}
+
+void handleSearchUser() {
+  if (!canAcceptClient()) {
+    server.send(503, "application/json", "{\"error\":\"Server is full. Try again later.\"}");
+    return;
+  }
+
+  if (currentUser.length() == 0) {
+    server.send(401, "application/json", "{\"error\":\"Not authenticated\"}");
+    disconnectClient();
+    return;
+  }
+
+  String searchUsername = server.arg("username");
+  if (searchUsername.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"Username parameter required\"}");
+    disconnectClient();
+    return;
+  }
+
+  User* user = getUser(searchUsername);
+  if (user != nullptr && user->username != currentUser) {
+    String response = "{\"username\":\"" + user->username + "\", \"display_name\":\"" + user->displayName + "\"}";
+    server.send(200, "application/json", response);
+  } else {
+    server.send(404, "application/json", "{\"error\":\"User not found\"}");
+  }
+  disconnectClient();
+}
+
+void handleSendMessage() {
+  if (!canAcceptClient()) {
+    server.send(503, "application/json", "{\"error\":\"Server is full. Try again later.\"}");
+    return;
+  }
+
+  if (currentUser.length() == 0) {
+    server.send(401, "application/json", "{\"error\":\"Not authenticated\"}");
+    disconnectClient();
+    return;
+  }
+
+  String toUser = server.arg("to_user");
+  String content = server.arg("content");
+
+  if (toUser.length() == 0 || content.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"Recipient and message content required\"}");
+    disconnectClient();
+    return;
+  }
+
+  if (!userExists(toUser)) {
+    server.send(404, "application/json", "{\"error\":\"Recipient user not found\"}");
+    disconnectClient();
+    return;
+  }
+
+  messages.push_back({currentUser, toUser, content, millis()});
+  saveMessagesToPreferences();
+  server.send(200, "application/json", "{\"success\":\"Message sent\"}");
+  disconnectClient();
+}
+
+void handleGetMessages() {
+  if (!canAcceptClient()) {
+    server.send(503, "application/json", "{\"error\":\"Server is full. Try again later.\"}");
+    return;
+  }
+
+  if (currentUser.length() == 0) {
+    server.send(401, "application/json", "{\"error\":\"Not authenticated\"}");
+    disconnectClient();
+    return;
+  }
+
+  String withUser = server.arg("with_user");
+  if (withUser.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"with_user parameter required\"}");
+    disconnectClient();
+    return;
+  }
+
+  String response = "[";
+  bool first = true;
+  
+  for (const Message& msg : messages) {
+    if ((msg.fromUser == currentUser && msg.toUser == withUser) || 
+        (msg.fromUser == withUser && msg.toUser == currentUser)) {
+      if (!first) response += ",";
+      first = false;
+      
+      response += "{\"from\":\"" + msg.fromUser + "\",";
+      response += "\"to\":\"" + msg.toUser + "\",";
+      response += "\"content\":\"" + msg.content + "\",";
+      response += "\"timestamp\":" + String(msg.timestamp) + "}";
+    }
+  }
+  
+  response += "]";
+  server.send(200, "application/json", response);
+  disconnectClient();
+}
+
+void handleGetChats() {
+  if (!canAcceptClient()) {
+    server.send(503, "application/json", "{\"error\":\"Server is full. Try again later.\"}");
+    return;
+  }
+
+  if (currentUser.length() == 0) {
+    server.send(401, "application/json", "{\"error\":\"Not authenticated\"}");
+    disconnectClient();
+    return;
+  }
+
+  std::vector<String> chatPartners;
+  
+  for (const Message& msg : messages) {
+    String partner = "";
+    if (msg.fromUser == currentUser) {
+      partner = msg.toUser;
+    } else if (msg.toUser == currentUser) {
+      partner = msg.fromUser;
+    }
+    
+    if (partner.length() > 0 && partner != currentUser) {
+      bool exists = false;
+      for (const String& existing : chatPartners) {
+        if (existing == partner) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists) {
+        chatPartners.push_back(partner);
+      }
+    }
+  }
+
+  String response = "[";
+  for (size_t i = 0; i < chatPartners.size(); i++) {
+    if (i > 0) response += ",";
+    User* user = getUser(chatPartners[i]);
+    String displayName = user != nullptr ? user->displayName : chatPartners[i];
+    response += "{\"username\":\"" + chatPartners[i] + "\", \"display_name\":\"" + displayName + "\"}";
+  }
+  response += "]";
+  
+  server.send(200, "application/json", response);
+  disconnectClient();
+}
+
+const String loginPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ChatFree - Login</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { 
+            font-family: Arial, sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container { 
+            width: 100%;
+            max-width: 400px;
+            background: white; 
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            position: relative;
+        }
+        h1 { 
+            text-align: center; 
+            color: #333; 
+            margin-bottom: 30px;
+        }
+        .tabs { 
+            display: flex; 
+            margin-bottom: 20px;
+        }
+        .tab { 
+            flex: 1; 
+            padding: 10px;
+            text-align: center; 
+            cursor: pointer; 
+            border-bottom: 2px solid transparent;
+        }
+        .tab.active { 
+            border-bottom: 2px solid #007bff;
+            color: #007bff;
+        }
+        .form { display: none; }
+        .form.active { display: block; }
+        input { 
+            width: 100%; 
+            padding: 12px;
+            margin: 8px 0;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        button { 
+            width: 100%; 
+            padding: 12px;
+            background: #007bff;
+            color: white; 
+            border: none; 
+            border-radius: 5px; 
+            cursor: pointer; 
+            font-size: 16px;
+            margin-top: 10px;
+        }
+        .status {
+            text-align: center;
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .error { background: #fee; color: #c33; }
+        .success { background: #efe; color: #363; }
+        
+        /* Стили для рекламного блока */
+        .online-ad {
+            background: linear-gradient(135deg, #0984e3 0%, #00cec9 100%); 
+            color: white; 
+            padding: 16px; 
+            margin: 15px 0; 
+            border-radius: 12px; 
+            text-align: center; 
+            cursor: pointer; 
+            border: none;
+            position: relative;
+            display: none;
+        }
+        .ad-close {
+            position: absolute;
+            top: 8px;
+            right: 12px;
+            background: #ff4757;
+            color: white;
+            border: none;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
+        }
+        .ad-timer {
+            font-size: 11px;
+            margin-top: 6px;
+            opacity: 0.8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>💬 Офлайн чат</h1>
+        <div class="tabs">
+            <div class="tab active" onclick="showTab('login')">Войти</div>
+            <div class="tab" onclick="showTab('register')">Регистрация</div>
+        </div>
+        
+        <div id="loginForm" class="form active">
+            <input type="text" id="loginUsername" placeholder="Логин">
+            <input type="password" id="loginPassword" placeholder="Пороль">
+            <button onclick="login()">Войти</button>
+            <div id="loginStatus" class="status"></div>
+        </div>
+        
+        <div id="registerForm" class="form">
+            <input type="text" id="regUsername" placeholder="Логин">
+            <input type="password" id="regPassword" placeholder="Пороль">
+            <input type="text" id="regDisplayName" placeholder="Отображаемое имя (необязательно)">
+            <button onclick="register()">Создать аккаунт</button>
+            <div id="regStatus" class="status"></div>
+        </div>
+        
+        <!-- Рекламный блок -->
+        <div class="online-ad" id="onlineAd" style="display: none;">
+            <button class="ad-close" onclick="closeAd()">×</button>
+            <div style="font-size: 15px; font-weight: 700; margin-bottom: 6px;">🌐 Онлайн-версия!</div>
+            <div style="font-size: 12px; opacity: 0.9; margin-bottom: 8px;">Я использую этот сайт для общение с друзьями хочешь попробовать?</div>
+            <div style="font-size: 11px; background: rgba(255,255,255,0.2); padding: 6px 10px; border-radius: 20px; display: inline-block;">
+                mikip.foxnodes.ru
+            </div>
+            <div class="ad-timer" id="adTimer">Исчезнет через: 60 сек</div>
+        </div>
+    </div>
+
+    <script>
+        let adTimer = null;
+        let timeLeft = 60;
+        let adShown = false;
+
+        function showTab(tabName) {
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            document.querySelectorAll('.form').forEach(form => form.classList.remove('active'));
+            
+            if (tabName === 'login') {
+                document.querySelector('.tab:nth-child(1)').classList.add('active');
+                document.getElementById('loginForm').classList.add('active');
+            } else {
+                document.querySelector('.tab:nth-child(2)').classList.add('active');
+                document.getElementById('registerForm').classList.add('active');
+            }
+        }
+
+        function showStatus(elementId, message, isError = true) {
+            const element = document.getElementById(elementId);
+            element.textContent = message;
+            element.className = `status ${isError ? 'error' : 'success'}`;
+        }
+
+        function showAd() {
+            if (adShown) return;
+            
+            const ad = document.getElementById('onlineAd');
+            ad.style.display = 'block';
+            adShown = true;
+            
+            // Запускаем таймер
+            timeLeft = 60;
+            updateTimer();
+            
+            adTimer = setInterval(function() {
+                timeLeft--;
+                updateTimer();
+                
+                if (timeLeft <= 0) {
+                    closeAd();
+                }
+            }, 1000);
+        }
+
+        function updateTimer() {
+            const timerElement = document.getElementById('adTimer');
+            if (timerElement) {
+                timerElement.textContent = `Исчезнет через: ${timeLeft} сек`;
+            }
+        }
+
+        function closeAd() {
+            const ad = document.getElementById('onlineAd');
+            ad.style.display = 'none';
+            
+            if (adTimer) {
+                clearInterval(adTimer);
+                adTimer = null;
+            }
+        }
+
+        async function login() {
+            const username = document.getElementById('loginUsername').value;
+            const password = document.getElementById('loginPassword').value;
+            
+            if (!username || !password) {
+                showStatus('loginStatus', 'Пожалуйста, заполните все поля', true);
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('username', username);
+            formData.append('password', password);
+            
+            try {
+                const response = await fetch('/api/login', { method: 'POST', body: formData });
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showStatus('loginStatus', 'Вы успешно вошли в аккаунт!', false);
+                    localStorage.setItem('currentUser', username);
+                    setTimeout(() => window.location.href = '/chat.html', 1000);
+                } else {
+                    showStatus('loginStatus', data.error || 'Login failed', true);
+                }
+            } catch (error) {
+                showStatus('loginStatus', 'Network error', true);
+            }
+        }
+
+        async function register() {
+            const username = document.getElementById('regUsername').value;
+            const password = document.getElementById('regPassword').value;
+            const displayName = document.getElementById('regDisplayName').value;
+            
+            if (!username || !password) {
+                showStatus('regStatus', 'Требуется имя пользователя и пароль', true);
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('username', username);
+            formData.append('password', password);
+            formData.append('display_name', displayName);
+            
+            try {
+                const response = await fetch('/api/register', { method: 'POST', body: formData });
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showStatus('regStatus', 'Вы успешно зарегистрировались! Теперь вы можете войти.', false);
+                    
+                    // Показываем рекламу после успешной регистрации
+                    setTimeout(showAd, 500);
+                    
+                    setTimeout(() => showTab('login'), 1500);
+                } else {
+                    showStatus('regStatus', data.error || 'Registration failed', true);
+                }
+            } catch (error) {
+                showStatus('regStatus', 'Network error', true);
+            }
+        }
+
+        // Закрытие рекламы по клику на область (опционально)
+        document.getElementById('onlineAd').addEventListener('click', function(e) {
+            if (e.target === this) {
+                window.open('http://mikip.foxnodes.ru', '_blank');
+            }
+        });
+    </script>
+</body>
+</html>
+)rawliteral";
+
+const String chatPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ChatFree</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <style>
+        * { 
+            box-sizing: border-box; 
+            margin: 0; 
+            padding: 0; 
+            -webkit-tap-highlight-color: transparent;
+        }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f2f2f7;
+            height: 100vh;
+            height: -webkit-fill-available;
+            overflow: hidden;
+        }
+        
+        /* Основной контейнер */
+        .app-container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            height: -webkit-fill-available;
+            max-width: 100%;
+            position: relative;
+        }
+        
+        /* Шапка */
+        .header {
+            background: #ffffff;
+            padding: 12px 16px;
+            border-bottom: 1px solid #c6c6c8;
+            backdrop-filter: blur(20px);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            min-height: 44px;
+        }
+        
+        .header-title {
+            font-size: 17px;
+            font-weight: 600;
+            color: #000;
+            margin-left: 40px; /* Добавляем отступ для стрелочки */
+        }
+        
+        .logout-btn {
+            background: none;
+            border: none;
+            color: #007AFF;
+            font-size: 16px;
+            padding: 8px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        
+        /* Кнопка назад в левом углу */
+        .back-to-chats-btn {
+            position: absolute;
+            top: 12px;
+            left: 20px; /* Подвинули вправо */
+            background: none;
+            border: none;
+            color: #000000; /* Черный цвет */
+            font-size: 24px; /* Увеличили размер */
+            font-weight: 700; /* Сделали толще */
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 101;
+            transition: background-color 0.2s;
+            text-decoration: none;
+        }
+        
+        .back-to-chats-btn:hover {
+            background-color: rgba(0, 0, 0, 0.1);
+        }
+        
+        .back-to-chats-btn:active {
+            background-color: rgba(0, 0, 0, 0.2);
+        }
+        
+        /* Список чатов */
+        .chats-container {
+            flex: 1;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            background: white;
+        }
+        
+        .chat-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            border-bottom: 1px solid #f0f0f0;
+            cursor: pointer;
+            min-height: 68px;
+        }
+        
+        .chat-item:active {
+            background-color: #f8f8f8;
+        }
+        
+        .chat-avatar {
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: #007AFF;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 600;
+            margin-right: 12px;
+            flex-shrink: 0;
+        }
+        
+        .chat-info {
+            flex: 1;
+            min-width: 0;
+        }
+        
+        .chat-name {
+            font-size: 16px;
+            font-weight: 600;
+            color: #000;
+            margin-bottom: 2px;
+        }
+        
+        .chat-last-message {
+            font-size: 14px;
+            color: #8e8e93;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        /* Экран чата */
+        .chat-screen {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: white;
+            transform: translateX(100%);
+            transition: transform 0.3s ease;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .chat-screen.active {
+            transform: translateX(0);
+        }
+        
+        .chat-header {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            border-bottom: 1px solid #c6c6c8;
+            background: white;
+            min-height: 44px;
+        }
+        
+        .back-btn {
+            background: none;
+            border: none;
+            font-size: 16px;
+            padding: 8px;
+            margin-right: 12px;
+            cursor: pointer;
+            color: #007AFF;
+        }
+        
+        .chat-with {
+            font-size: 17px;
+            font-weight: 600;
+        }
+        
+        .messages-container {
+            flex: 1;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            padding: 16px;
+            background: #f2f2f7;
+            /* Убираем автоматическое поведение прокрутки */
+            overscroll-behavior: contain;
+        }
+        
+        .message {
+            max-width: 85%;
+            margin-bottom: 12px;
+            position: relative;
+        }
+        
+        .message.own {
+            margin-left: auto;
+        }
+        
+        .message-bubble {
+            padding: 12px 16px;
+            border-radius: 18px;
+            font-size: 16px;
+            line-height: 1.4;
+            word-wrap: break-word;
+        }
+        
+        .message.own .message-bubble {
+            background: #007AFF;
+            color: white;
+            border-bottom-right-radius: 6px;
+        }
+        
+        .message.other .message-bubble {
+            background: white;
+            color: #000;
+            border-bottom-left-radius: 6px;
+            border: 1px solid #e5e5ea;
+        }
+        
+        .message-time {
+            font-size: 11px;
+            color: #8e8e93;
+            margin-top: 4px;
+            text-align: right;
+        }
+        
+        /* Поле ввода */
+        .input-area {
+            padding: 12px 16px;
+            background: white;
+            border-top: 1px solid #c6c6c8;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .message-input {
+            flex: 1;
+            padding: 12px 16px;
+            border: 1px solid #c6c6c8;
+            border-radius: 20px;
+            font-size: 16px;
+            background: #f2f2f7;
+            outline: none;
+        }
+        
+        .message-input:focus {
+            border-color: #007AFF;
+        }
+        
+        .send-btn {
+            background: #007AFF;
+            color: white;
+            border: none;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        
+        .send-btn:disabled {
+            background: #c6c6c8;
+            cursor: not-allowed;
+        }
+        
+        /* Поиск */
+        .search-container {
+            padding: 12px 16px;
+            background: white;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        
+        .search-box {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .search-input {
+            flex: 1;
+            padding: 12px 16px;
+            border: 1px solid #c6c6c8;
+            border-radius: 10px;
+            font-size: 16px;
+            background: #f2f2f7;
+        }
+        
+        .search-btn {
+            background: #007AFF;
+            color: white;
+            border: none;
+            padding: 12px 16px;
+            border-radius: 10px;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        
+        /* Индикатор новых сообщений */
+        .new-message-indicator {
+            position: absolute;
+            bottom: 80px;
+            right: 20px;
+            background: #007AFF;
+            color: white;
+            border: none;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            z-index: 10;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        
+        .new-message-indicator.visible {
+            opacity: 1;
+        }
+        
+        /* Адаптация под разные экраны */
+        @media (min-width: 768px) {
+            .app-container {
+                max-width: 414px; /* iPhone 11 width */
+                margin: 0 auto;
+                border-left: 1px solid #c6c6c8;
+                border-right: 1px solid #c6c6c8;
+            }
+        }
+        
+        /* Safe area для iPhone X+ */
+        @supports(padding: max(0px)) {
+            .header, .chat-header {
+                padding-left: max(16px, env(safe-area-inset-left));
+                padding-right: max(16px, env(safe-area-inset-right));
+            }
+            
+            .input-area {
+                padding-bottom: max(12px, env(safe-area-inset-bottom));
+            }
+            
+            .back-to-chats-btn {
+                left: max(20px, calc(env(safe-area-inset-left) + 4px));
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Кнопка назад в левом углу -->
+        <button class="back-to-chats-btn" id="backToChatsBtn" onclick="showChatsList()" style="display: none;">
+            ←
+        </button>
+        
+        <!-- Основной экран со списком чатов -->
+        <div class="header">
+            <div class="header-title">Чаты</div>
+            <button class="logout-btn" onclick="logout()">Выйти</button>
+        </div>
+        
+        <div class="search-container">
+            <div class="search-box">
+                <input type="text" id="searchInput" class="search-input" placeholder="Найти пользователя...">
+                <button class="search-btn" onclick="searchUser()">Найти</button>
+            </div>
+        </div>
+        
+        <div class="chats-container" id="chatsList">
+            <div style="text-align: center; padding: 40px; color: #8e8e93;">
+                Нет активных чатов
+            </div>
+        </div>
+        
+        <!-- Экран конкретного чата -->
+        <div class="chat-screen" id="chatScreen">
+            <div class="chat-header">
+                <button class="back-btn" onclick="closeChat()">← Назад</button>
+                <div class="chat-with" id="chatWithUser"></div>
+            </div>
+            
+            <div class="messages-container" id="messagesContainer">
+                <div style="text-align: center; padding: 40px; color: #8e8e93;">
+                    Начните общение
+                </div>
+            </div>
+            
+            <!-- Кнопка для прокрутки к новым сообщениям -->
+            <button class="new-message-indicator" id="newMessageIndicator" onclick="scrollToBottom()">
+                ↓
+            </button>
+            
+            <div class="input-area">
+                <input type="text" id="messageInput" class="message-input" placeholder="Сообщение..." onkeypress="handleKeyPress(event)">
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled>
+                    ↑
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentChat = null;
+        let chatInterval = null;
+        let allChats = [];
+        let isNearBottom = true;
+        let messagesContainer = null;
+
+        document.addEventListener('DOMContentLoaded', function() {
+            const user = localStorage.getItem('currentUser');
+            if (!user) {
+                window.location.href = '/';
+                return;
+            }
+            
+            messagesContainer = document.getElementById('messagesContainer');
+            
+            // Настройка обработчика прокрутки
+            messagesContainer.addEventListener('scroll', handleScroll);
+            
+            loadChats();
+            chatInterval = setInterval(loadChats, 3000);
+            
+            // Обработка ввода сообщения
+            document.getElementById('messageInput').addEventListener('input', function() {
+                document.getElementById('sendBtn').disabled = !this.value.trim();
+            });
+        });
+
+        function handleScroll() {
+            if (!messagesContainer) return;
+            
+            const container = messagesContainer;
+            const scrollThreshold = 100; // пикселей от нижнего края
+            
+            // Проверяем, находится ли пользователь near bottom
+            isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= scrollThreshold;
+            
+            // Показываем/скрываем индикатор новых сообщений
+            const indicator = document.getElementById('newMessageIndicator');
+            if (!isNearBottom) {
+                indicator.classList.add('visible');
+            } else {
+                indicator.classList.remove('visible');
+            }
+        }
+
+        function scrollToBottom() {
+            if (messagesContainer) {
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                document.getElementById('newMessageIndicator').classList.remove('visible');
+                isNearBottom = true;
+            }
+        }
+
+        // Функция для показа списка чатов
+        function showChatsList() {
+            closeChat();
+        }
+
+        async function loadChats() {
+            try {
+                const response = await fetch('/api/chats');
+                if (response.ok) {
+                    const chats = await response.json();
+                    allChats = chats;
+                    displayChats(chats);
+                    
+                    // Если открыт чат, обновляем сообщения
+                    if (currentChat) {
+                        loadMessages(currentChat);
+                    }
+                }
+            } catch (error) {
+                console.error('Ошибка загрузки чатов:', error);
+            }
+        }
+
+        function displayChats(chats) {
+            const container = document.getElementById('chatsList');
+            
+            if (chats.length === 0) {
+                container.innerHTML = '<div style="text-align: center; padding: 40px; color: #8e8e93;">Нет активных чатов</div>';
+                return;
+            }
+            
+            container.innerHTML = chats.map(chat => `
+                <div class="chat-item" onclick="openChat('${chat.username}')">
+                    <div class="chat-avatar">
+                        ${(chat.display_name || chat.username).charAt(0).toUpperCase()}
+                    </div>
+                    <div class="chat-info">
+                        <div class="chat-name">${chat.display_name || chat.username}</div>
+                        <div class="chat-last-message">Нажмите для общения</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function openChat(username) {
+            currentChat = username;
+            document.getElementById('chatWithUser').textContent = username;
+            document.getElementById('chatScreen').classList.add('active');
+            
+            // Показываем кнопку назад в левом углу
+            document.getElementById('backToChatsBtn').style.display = 'flex';
+            
+            loadMessages(username);
+            // Сбрасываем состояние прокрутки
+            isNearBottom = true;
+        }
+
+        function closeChat() {
+            currentChat = null;
+            document.getElementById('chatScreen').classList.remove('active');
+            document.getElementById('messageInput').value = '';
+            document.getElementById('sendBtn').disabled = true;
+            
+            // Скрываем кнопку назад в левом углу
+            document.getElementById('backToChatsBtn').style.display = 'none';
+            
+            // Скрываем индикатор при закрытии чата
+            document.getElementById('newMessageIndicator').classList.remove('visible');
+        }
+
+        async function loadMessages(withUser) {
+            try {
+                const response = await fetch('/api/messages?with_user=' + encodeURIComponent(withUser));
+                if (response.ok) {
+                    const messages = await response.json();
+                    displayMessages(messages);
+                }
+            } catch (error) {
+                console.error('Ошибка загрузки сообщений:', error);
+            }
+        }
+
+        function displayMessages(messages) {
+            const container = document.getElementById('messagesContainer');
+            const currentUser = localStorage.getItem('currentUser');
+            
+            if (messages.length === 0) {
+                container.innerHTML = '<div style="text-align: center; padding: 40px; color: #8e8e93;">Нет сообщений</div>';
+                return;
+            }
+            
+            container.innerHTML = messages.map(msg => {
+                const isOwn = msg.from === currentUser;
+                const time = new Date(msg.timestamp).toLocaleTimeString('ru-RU', { 
+                    hour: '2-digit', 
+                    minute: '2-digit' 
+                });
+                
+                return `
+                    <div class="message ${isOwn ? 'own' : 'other'}">
+                        <div class="message-bubble">${msg.content}</div>
+                        <div class="message-time">${time}</div>
+                    </div>
+                `;
+            }).join('');
+            
+            // Прокручиваем вниз только если пользователь уже был near bottom
+            if (isNearBottom) {
+                container.scrollTop = container.scrollHeight;
+            }
+        }
+
+        async function searchUser() {
+            const username = document.getElementById('searchInput').value.trim();
+            
+            if (!username) {
+                alert('Введите имя пользователя');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/search?username=' + encodeURIComponent(username));
+                if (response.ok) {
+                    const user = await response.json();
+                    openChat(user.username);
+                    document.getElementById('searchInput').value = '';
+                } else {
+                    alert('Пользователь не найден');
+                }
+            } catch (error) {
+                alert('Ошибка поиска');
+            }
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const content = input.value.trim();
+            
+            if (content && currentChat) {
+                const formData = new FormData();
+                formData.append('to_user', currentChat);
+                formData.append('content', content);
+                
+                try {
+                    const response = await fetch('/api/send_message', { 
+                        method: 'POST', 
+                        body: formData 
+                    });
+                    
+                    if (response.ok) {
+                        input.value = '';
+                        document.getElementById('sendBtn').disabled = true;
+                        loadMessages(currentChat);
+                        loadChats();
+                        // После отправки сообщения автоматически прокручиваем вниз
+                        isNearBottom = true;
+                    }
+                } catch (error) {
+                    console.error('Ошибка отправки:', error);
+                    alert('Ошибка отправки сообщения');
+                }
+            }
+        }
+
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+
+        async function logout() {
+            try {
+                await fetch('/api/logout');
+            } catch (error) {
+                // Игнорируем ошибки
+            }
+            localStorage.removeItem('currentUser');
+            window.location.href = '/';
+        }
+
+        // Предотвращение масштабирования на iOS
+        document.addEventListener('touchmove', function(e) {
+            if (e.scale !== 1) {
+                e.preventDefault();
+            }
+        }, { passive: false });
+    </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  if (!canAcceptClient()) {
+    server.send(503, "text/html", "Server is full");
+    return;
+  }
+  server.send(200, "text/html", loginPage);
+  disconnectClient();
+}
+
+void handleChat() {
+  if (!canAcceptClient()) {
+    server.send(503, "text/html", "Server is full");
+    return;
+  }
+  server.send(200, "text/html", chatPage);
+  disconnectClient();
+}
+
+void handleNotFound() {
+  if (server.uri() == "/") {
+    handleRoot();
+  } else if (server.uri() == "/chat.html") {
+    handleChat();
+  } else if (server.uri() == "/api/register") {
+    handleRegister();
+  } else if (server.uri() == "/api/login") {
+    handleLogin();
+  } else if (server.uri() == "/api/logout") {
+    handleLogout();
+  } else if (server.uri() == "/api/search") {
+    handleSearchUser();
+  } else if (server.uri() == "/api/send_message") {
+    handleSendMessage();
+  } else if (server.uri() == "/api/messages") {
+    handleGetMessages();
+  } else if (server.uri() == "/api/chats") {
+    handleGetChats();
+  } else {
+    server.send(404, "text/plain", "Not Found");
+  }
+}
+
+void setup(void) {
+  DBG_OUTPUT_PORT.begin(115200);
+  DBG_OUTPUT_PORT.print("\n");
+
+  loadUsersFromPreferences();
+  loadMessagesFromPreferences();
+
+  WiFi.softAP(ssid, password);
+  DBG_OUTPUT_PORT.print("Access Point: ");
+  DBG_OUTPUT_PORT.println(ssid);
+  DBG_OUTPUT_PORT.print("IP address: ");
+  DBG_OUTPUT_PORT.println(WiFi.softAPIP());
+
+  if (MDNS.begin(host)) {
+    DBG_OUTPUT_PORT.println("MDNS responder started");
+  }
+
+  server.on("/", handleRoot);
+  server.on("/chat.html", handleChat);
+  server.on("/api/register", handleRegister);
+  server.on("/api/login", handleLogin);
+  server.on("/api/logout", handleLogout);
+  server.on("/api/search", handleSearchUser);
+  server.on("/api/send_message", handleSendMessage);
+  server.on("/api/messages", handleGetMessages);
+  server.on("/api/chats", handleGetChats);
+  
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+  DBG_OUTPUT_PORT.println("HTTP server started");
+
+  if (users.size() == 0) {
+    users.push_back({"user1", "pass1", "User One"});
+    users.push_back({"user2", "pass2", "User Two"});
+    saveUsersToPreferences();
+  }
+}
+
+void loop(void) {
+  server.handleClient();
+  delay(2);
+}
