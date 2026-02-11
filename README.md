@@ -37,3 +37,6 @@
 Попробуйте адрес: 192.168.4.1
 
 Наслаждайтесь общением! 🎯
+<p align="center">
+  <img src="https://raw.githubusercontent.com/foxymfjd3882jr/esp32-cam-chat/refs/heads/main/33258254f9e27348288adb4be66f4fdcd017f6c3_original.jpeg" width="320" alt="ESP32-CAM">
+</p>
